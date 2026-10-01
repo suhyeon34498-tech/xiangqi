@@ -149,7 +149,13 @@ select{background-image:none}
     <option value="RED">红方（你执红先手，军师帮你走红）</option>
     <option value="BLACK">黑方（你执黑后手，军师帮你走黑）</option>
   </select>
-  <label class="f">军师棋力（内置引擎，越强越慢；不联网、不花 token）</label>
+  <label class="f">军师引擎（棋力差距巨大）</label>
+  <select id="setEngine">
+    <option value="js">内置轻量引擎 —— 秒出、离线、深度 6~7 层</option>
+    <option value="pika">Pikafish 超人类引擎 —— 深度 14+ 层（首次需下载 18MB，之后本地缓存）</option>
+  </select>
+  <div class="muted" id="pikaStatus" style="font-size:12.5px;margin-top:4px"></div>
+  <label class="f">军师棋力（越强越慢；不花 token）</label>
   <select id="setStrength">
     <option value="400">快 —— 0.4 秒/步</option>
     <option value="1200">标准 —— 1.2 秒/步（推荐）</option>
@@ -702,6 +708,7 @@ const S = {
   history: [],           // {fen, side, notation, captured, lastMove}
   apiKey: '', model: 'deepseek-flash', visionModel: '', baseUrl: 'https://api.deepseek.com',
   engineMs: 1200,        // 内置引擎每步思考时间（毫秒）
+  engineType: 'js',      // 'js' 内置轻量引擎 | 'pika' Pikafish WASM
   wantReason: false,     // 是否让大模型额外补充讲解
   pendingCapture: 'environment',
   hasFlipCfg: false,
@@ -759,7 +766,7 @@ function keyFromHash(){
 function cfgObject(){
   return { apiKey:S.apiKey, model:S.model, visionModel:S.visionModel, baseUrl:S.baseUrl,
            aiSide:S.aiSide, autoAI:S.autoAI, flipped:S.flipped,
-           engineMs:S.engineMs, wantReason:S.wantReason };
+           engineMs:S.engineMs, wantReason:S.wantReason, engineType:S.engineType };
 }
 function saveCfg(){
   const o = cfgObject();
@@ -776,6 +783,7 @@ function applyCfg(c){
   if(typeof c.autoAI === 'boolean') S.autoAI = c.autoAI;
   if(typeof c.flipped === 'boolean'){ S.flipped = c.flipped; S.hasFlipCfg = true; }
   if(typeof c.engineMs === 'number') S.engineMs = c.engineMs;
+  if(c.engineType === 'js' || c.engineType === 'pika') S.engineType = c.engineType;
   if(typeof c.wantReason === 'boolean') S.wantReason = c.wantReason;
 }
 function loadCfgSync(){
@@ -1175,6 +1183,8 @@ function handleClick(x,y){
 
 /* ============================ 走子后的推进 ============================ */
 function afterMove(){
+  S.suggest = null;
+  $('aiOut').innerHTML = '';
   if(checkGameEnd()) return;
   refreshUI();
   if(S.autoAI && S.turn === S.aiSide && !S.thinking){
@@ -1351,6 +1361,138 @@ function describeBoardForPrompt(){
   }
   return rows.join('\n');
 }
+/* ---------- Pikafish WASM 引擎管理 ---------- */
+// 三件套（pikafish.js/.wasm/.data）放在页面同目录的 pikafish/ 下。
+// 主线程负责下载并用 Cache API 缓存，然后 transfer 给 Worker。
+const PikaEngine = (() => {
+  const BASE = 'pikafish/';
+  const FILES = ['pikafish.wasm', 'pikafish.data'];
+  const CACHE_NAME = 'pikafish-v1';
+  let worker = null;
+  let state = 'unloaded';   // unloaded | loading | ready | error
+  let readyPromise = null;
+  let searchSeq = 0;
+  let onInfo = null;        // (info) => void 进度回调
+  let pendingResolve = null;
+
+  function status(html){ const el = $('pikaStatus'); if(el) el.innerHTML = html; }
+
+  // 带缓存 + 进度的资源下载
+  async function fetchCached(url, onProgress){
+    try{
+      if(self.caches){
+        const cache = await caches.open(CACHE_NAME);
+        const hit = await cache.match(url);
+        if(hit) return await hit.arrayBuffer();
+      }
+    }catch(e){ /* 隐私模式下 Cache API 可能不可用，降级直接下载 */ }
+    const resp = await fetch(url);
+    if(!resp.ok) throw new Error('下载失败 HTTP ' + resp.status);
+    let buf;
+    const total = +resp.headers.get('Content-Length') || 0;
+    if(resp.body && total){
+      const reader = resp.body.getReader();
+      const chunks = []; let got = 0;
+      for(;;){
+        const {done, value} = await reader.read();
+        if(done) break;
+        chunks.push(value); got += value.length;
+        if(onProgress) onProgress(got / total);
+      }
+      buf = await new Blob(chunks).arrayBuffer();
+    }else{
+      buf = await resp.arrayBuffer();
+    }
+    try{
+      if(self.caches){
+        const cache = await caches.open(CACHE_NAME);
+        await cache.put(url, new Response(buf.slice(0), {headers:{'Content-Length': String(buf.byteLength)}}));
+      }
+    }catch(e){ /* 缓存失败不影响使用 */ }
+    return buf;
+  }
+
+  function initWorker(wasm, data){
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let w;
+      try{ w = new Worker(BASE + 'worker.js'); }
+      catch(e){ reject(new Error('无法创建 Worker（本地 file:// 方式请用轻量引擎）')); return; }
+      const timer = setTimeout(() => { if(!settled){ settled = true; try{w.terminate();}catch(e){} reject(new Error('引擎初始化超时')); } }, 60000);
+      w.onerror = () => { if(!settled){ settled = true; clearTimeout(timer); reject(new Error('引擎加载失败')); } };
+      w.onmessage = (e) => {
+        const m = e.data;
+        if(m.type === 'dbg'){
+          (window.__pikaDbg = window.__pikaDbg || []).push(m.msg);
+          return;
+        }else if(m.type === 'ready' && !settled){
+          settled = true; clearTimeout(timer);
+          worker = w; state = 'ready';
+          resolve();
+        }else if(m.type === 'bestmove'){
+          if(pendingResolve){
+            const r = pendingResolve; pendingResolve = null;
+            r(m);
+          }
+        }else if(m.type === 'info'){
+          if(onInfo) onInfo(m);
+        }else if(m.type === 'error' && !settled){
+          settled = true; clearTimeout(timer); reject(new Error(m.message || '引擎错误'));
+        }
+      };
+      w.postMessage({cmd:'init', wasm, data}, [wasm, data]);
+    });
+  }
+
+  function ensureReady(){
+    if(state === 'ready') return Promise.resolve();
+    if(readyPromise) return readyPromise;
+    state = 'loading';
+    readyPromise = (async () => {
+      const bufs = {};
+      for(const f of FILES){
+        const isBig = f.endsWith('.data');
+        bufs[f] = await fetchCached(BASE + f, isBig ? (p => {
+          status('Pikafish 神经网络下载中 ' + Math.round(p * 100) + '%（首次下载，之后本地缓存）');
+        }) : null);
+      }
+      status('Pikafish 引擎初始化中…');
+      await initWorker(bufs['pikafish.wasm'], bufs['pikafish.data']);
+      status('✅ Pikafish 引擎已就绪（超人类棋力，走棋不联网）');
+    })();
+    readyPromise.catch(err => {
+      state = 'error'; readyPromise = null;
+      status('⚠️ Pikafish 加载失败：' + esc(String(err.message || err)) + '（自动回退轻量引擎）');
+    });
+    return readyPromise;
+  }
+
+  // 返回 {move:{from,to}|null, score, depth, ms}，score 为轮走方视角（百分兵）
+  function search(fen, movetime){
+    return new Promise((resolve, reject) => {
+      if(state !== 'ready' || !worker){ reject(new Error('Pikafish 未就绪')); return; }
+      const id = ++searchSeq;
+      const t0 = Date.now();
+      let lastInfo = null;
+      pendingResolve = (m) => {
+        if(m.id !== id){ resolve({ move: null }); return; }
+        const out = { ms: Date.now() - t0, move: m.move };
+        if(lastInfo){ out.score = lastInfo.score; out.depth = lastInfo.depth; }
+        lastInfo = null;
+        resolve(out);
+      };
+      onInfo = (info) => { lastInfo = info; };
+      worker.postMessage({cmd:'search', fen, movetime, id});
+      // movetime 内必回 bestmove；再加硬超时兜底
+      setTimeout(() => {
+        if(pendingResolve){ pendingResolve = null; reject(new Error('搜索超时')); }
+      }, Math.max(movetime + 25000, 30000));
+    });
+  }
+
+  return { ensureReady, search, get state(){ return state; } };
+})();
+
 /* ---------- 军师想一步 ---------- */
 // 内置引擎算棋：0 token、秒出、不会白送子
 function engineThink(){
@@ -1364,18 +1506,28 @@ function engineThink(){
   const r = Engine.search(fen, { depth: 24, timeMs: S.engineMs, avoid: avoid });
   if(!r) return null;
   const dt = Date.now() - t0;
-  // 分值转成人话
-  let evalTxt;
-  const sc = r.score;
-  if(Math.abs(sc) > Engine.MATE - 1000){
-    evalTxt = (sc > 0 ? '军师已算到杀棋' : '局面危险，对方有杀棋');
-  }else{
-    const v = sc / Engine.VAL[7];            // 折算成「兵」为单位（VAL[7] 即一兵的价值）
-    if(Math.abs(v) < 0.5) evalTxt = '局面基本均势';
-    else evalTxt = (v > 0 ? '红方' : '黑方') + '占优，约 ' + Math.abs(v).toFixed(1) + ' 个兵的优势';
-  }
+  // 引擎分值是「轮走方视角」，统一转成红方视角再解读
+  const scRed = (S.turn === 'RED' ? r.score : -r.score);
   return { from:{x:r.from.x,y:r.from.y}, to:{x:r.to.x,y:r.to.y},
-           score:sc, depth:r.depth, nodes:r.nodes, ms:dt, evalTxt };
+           score:scRed, depth:r.depth, nodes:r.nodes, ms:dt, evalTxt: evalTextJs(scRed) };
+}
+
+// 分值→人话。JS 引擎单位同 VAL（100=1兵），Pikafish 单位是 cp（100cp=1兵）
+function evalTextJs(scRed){
+  if(Math.abs(scRed) > Engine.MATE - 1000){
+    return scRed > 0 ? '军师已算到杀棋' : '局面危险，对方有杀棋';
+  }
+  const v = scRed / Engine.VAL[7];
+  if(Math.abs(v) < 0.5) return '局面基本均势';
+  return (v > 0 ? '红方' : '黑方') + '占优，约 ' + Math.abs(v).toFixed(1) + ' 个兵的优势';
+}
+function evalTextPika(cpRed, isMate){
+  if(isMate){
+    return (cpRed > 0 ? '军师 ' : '对方 ') + Math.ceil(Math.abs(cpRed)) + ' 步内可杀';
+  }
+  const v = cpRed / 100;
+  if(Math.abs(v) < 0.5) return '局面基本均势';
+  return (v > 0 ? '红方' : '黑方') + '占优，约 ' + Math.abs(v).toFixed(1) + ' 个兵的优势';
 }
 
 async function thinkOneMove(auto){
@@ -1390,12 +1542,35 @@ async function thinkOneMove(auto){
   out.innerHTML = '<span class="spin"></span>军师正在思考…';
 
   let from = null, to = null, autoApply = false;
+  let engineName = '轻量引擎';
   try{
-    // ---- 1) 内置引擎算棋（主脑，离线、0 token）----
-    out.innerHTML = '<span class="spin"></span>军师正在思考…（内置引擎计算中）';
-    await new Promise(r => setTimeout(r, 30));    // 让 UI 先刷新
-    const res = engineThink();
-    if(!res) throw new Error('这个局面没有可用着法');
+    // ---- 1) 引擎算棋（主脑，离线、0 token）----
+    let res = null;
+    if(S.engineType === 'pika'){
+      try{
+        await PikaEngine.ensureReady();
+        engineName = 'Pikafish';
+        out.innerHTML = '<span class="spin"></span>Pikafish 计算中…';
+        await new Promise(r => setTimeout(r, 30));
+        const r = await PikaEngine.search(currentFen(), S.engineMs);
+        if(!r || !r.move) throw new Error('未给出着法');
+        // 用规则库验证着法合法性（坐标系换算出错时绝不能落子）
+        if(!isLegal(r.move.from, r.move.to)) throw new Error('着法不合法');
+        const scRed = (S.turn === 'RED' ? r.score : -r.score);
+        res = { from: r.move.from, to: r.move.to, depth: r.depth || 0, ms: r.ms,
+                evalTxt: evalTextPika(scRed || 0, !!r.mate) };
+      }catch(pe){
+        engineName = '轻量引擎';
+        toast('Pikafish 不可用（' + String(pe.message || pe).slice(0, 40) + '），已回退轻量引擎');
+        res = null;
+      }
+    }
+    if(!res){
+      out.innerHTML = '<span class="spin"></span>军师正在思考…（内置引擎计算中）';
+      await new Promise(r => setTimeout(r, 30));    // 让 UI 先刷新
+      res = engineThink();
+      if(!res) throw new Error('这个局面没有可用着法');
+    }
     from = res.from; to = res.to;
 
     S.suggest = { from, to, reason: res.evalTxt };
@@ -1405,8 +1580,8 @@ async function thinkOneMove(auto){
       '<b>军师建议：</b>' + esc(p?p.name:'') + ' ' + notate(from,to) +
       (capPc ? '（吃' + esc(capPc.name) + '）' : '') +
       '　<span class="muted">(' + from.x + ',' + from.y + ' → ' + to.x + ',' + to.y + ')</span>\n' +
-      '<span class="muted">引擎评估：' + esc(res.evalTxt) +
-      '　深度 ' + res.depth + '　' + res.ms + 'ms　0 token</span>';
+      '<span class="muted">[' + esc(engineName) + '] 评估：' + esc(res.evalTxt) +
+      '　深度 ' + (res.depth || '?') + '　' + res.ms + 'ms　0 token</span>';
     const btn = document.createElement('button');
     btn.className = 'primary'; btn.textContent = '按军师说的走'; btn.style.marginTop = '8px';
     btn.onclick = ()=>{
@@ -1688,6 +1863,15 @@ $('setSide').onchange = (e)=>{
   newGame();
 };
 $('setKey').oninput = (e)=>{ S.apiKey = e.target.value.trim(); saveCfg(); };
+$('setEngine').onchange = (e)=>{
+  S.engineType = e.target.value; saveCfg();
+  if(S.engineType === 'pika'){
+    PikaEngine.ensureReady();
+    toast('已切换到 Pikafish 引擎（首次会下载 18MB 神经网络）');
+  }else{
+    toast('已切换到内置轻量引擎');
+  }
+};
 $('setStrength').onchange = (e)=>{ S.engineMs = +e.target.value; saveCfg();
   toast('军师棋力：' + e.target.options[e.target.selectedIndex].text); };
 $('setModel').oninput = (e)=>{ S.model = e.target.value.trim() || 'deepseek-flash'; saveCfg(); };
@@ -1743,6 +1927,8 @@ function boot(){
   $('setBase').value = S.baseUrl;
   $('setSide').value = S.aiSide;
   $('setStrength').value = String(S.engineMs);
+  $('setEngine').value = S.engineType;
+  if(S.engineType === 'pika') PikaEngine.ensureReady();
   $('autoAI').checked = S.autoAI;
   if(!S.hasFlipCfg) orientToAiSide();     // 首次使用：按执方摆正视角
   newGame();
